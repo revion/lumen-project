@@ -61,3 +61,13 @@ $router->post('/shop/filter', ['middleware' => 'auth', 'uses' => 'ShopController
 
 $router->post('/user/get', ['middleware' => 'auth', 'uses' => 'UserController@mycart']);
 $router->post('/user/search', ['middleware' => 'auth', 'uses' => 'UserController@search']);
+
+// ---------------------------------------------------------------------------
+// Modul Training: Optimasi Query MySQL – Subquery Agregat (COUNT, SUM)
+// ---------------------------------------------------------------------------
+$router->get('/training/query-optimization', 'TrainingController@info');
+$router->get('/training/query-optimization/slow', 'TrainingController@slowQuery');
+$router->get('/training/query-optimization/optimized', 'TrainingController@optimizedQuery');
+$router->get('/training/query-optimization/explain-slow', 'TrainingController@explainSlow');
+$router->get('/training/query-optimization/explain-optimized', 'TrainingController@explainOptimized');
+$router->get('/training/query-optimization/compare', 'TrainingController@compare');
