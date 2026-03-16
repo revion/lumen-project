@@ -12,15 +12,15 @@
 
 ## Latar Belakang
 
-Operator `OR` adalah salah satu operator logika yang paling sering digunakan dalam query SQL, khususnya pada fitur pencarian (*search*). Contoh penggunaan paling umum:
+Operator `OR` adalah salah satu operator logika yang paling sering digunakan dalam query SQL, khususnya pada fitur pencarian (*search*). Pola yang umum dipakai — termasuk yang sudah menggunakan *start-with* agar lebih cepat — kira-kira seperti ini:
 
 ```sql
 SELECT * FROM products
-WHERE name LIKE '%samsung%'
-OR brand_name LIKE '%samsung%';
+WHERE name LIKE 'samsung%'
+OR brand_name LIKE 'samsung%';
 ```
 
-Secara logika, query di atas terlihat wajar dan mudah dipahami. Namun, seiring bertambahnya jumlah data (*data volume*), query semacam ini mulai menunjukkan masalah performa yang serius.
+Secara logika, query di atas terlihat wajar dan bahkan sudah "lebih baik" karena tidak ada wildcard di awal string. Namun, seiring bertambahnya jumlah data (*data volume*), query semacam ini **tetap** menunjukkan masalah performa yang serius.
 
 ### Gambaran Masalah
 
@@ -35,64 +35,89 @@ Bayangkan sebuah tabel `products` yang berisi **10 juta baris** data. Ketika pen
 
 ## Mengapa OR Lambat di MySQL?
 
-### 1. OR Menghambat Penggunaan Index
+### 1. OR Menghambat Penggunaan Index, Bahkan dengan Start-With
 
-MySQL menggunakan struktur data **B-Tree Index** untuk mempercepat pencarian. Index ini bekerja sangat efisien ketika MySQL bisa mempersempit pencarian dari awal (seperti membuka buku dari daftar isi).
+MySQL menggunakan struktur data **B-Tree Index** untuk mempercepat pencarian. Index ini bekerja sangat efisien untuk pola *start-with* (`LIKE 'kata%'`) pada **satu kolom** — MySQL bisa langsung melompat ke posisi yang tepat di index, seperti membuka buku dari daftar isi.
 
-Masalahnya: **ketika ada `OR`, MySQL seringkali tidak dapat menggunakan index secara optimal**, karena setiap kondisi di sisi kiri dan kanan `OR` dapat mengembalikan *set data yang berbeda*, sehingga MySQL harus menggabungkan keduanya.
+Masalahnya dimulai ketika `OR` masuk ke gambar:
 
 ```sql
--- Index pada kolom `name` ada, tapi query ini sering tidak memanfaatkannya secara penuh
+-- Index pada `name` ada dan BISA dipakai untuk LIKE 'samsung%' sendiri.
+-- Tapi begitu ada OR dengan kolom lain, optimizer sering tidak bisa pakai keduanya secara efisien.
 SELECT * FROM products
-WHERE name LIKE '%samsung%'   -- kondisi 1: pakai LIKE dengan wildcard di depan ('%...')
-OR brand_name LIKE '%samsung%'; -- kondisi 2: kolom lain
+WHERE name LIKE 'samsung%'        -- kondisi 1: bisa pakai index
+OR brand_name LIKE 'samsung%';    -- kondisi 2: kolom lain, index berbeda
 ```
 
-**Masalah tambahan dengan `LIKE '%kata%'`:** Penggunaan wildcard `%` di *awal* string (prefix wildcard) **selalu menyebabkan full index scan** atau bahkan full table scan, karena MySQL tidak tahu di mana dalam index string tersebut berada.
+Ketika ada `OR` antara dua kolom yang masing-masing memiliki index berbeda, MySQL harus:
+1. Scan index pertama untuk kondisi pertama → hasilkan *result set A*
+2. Scan index kedua untuk kondisi kedua → hasilkan *result set B*
+3. Gabungkan A dan B, buang duplikat
 
-### 2. Full Table Scan
+Proses penggabungan ini (disebut **Index Merge Union**) memiliki overhead yang signifikan. Dan dalam banyak kasus — terutama jika selectivity-nya rendah atau tabel hasil JOIN besar — MySQL justru memilih untuk **meninggalkan index sama sekali** dan melakukan full scan, karena optimizer menghitung bahwa full scan lebih murah daripada bolak-balik merge.
 
-Ketika MySQL tidak bisa menggunakan index dengan efisien, ia akan melakukan **full table scan** — artinya MySQL memeriksa *setiap baris* dalam tabel, satu per satu, untuk mengevaluasi kondisi `OR`.
+### 2. OR Lintas Tabel JOIN Memaksa Full Scan
 
-Untuk tabel dengan jutaan baris, ini sangat mahal secara komputasi.
+Masalah semakin parah ketika `OR` menyeberang ke kolom dari tabel yang di-JOIN. MySQL tidak dapat mendorong (*push down*) filter `OR` ke masing-masing tabel secara terpisah sebelum JOIN dilakukan.
 
 Anda bisa memverifikasi ini menggunakan perintah `EXPLAIN`:
 
 ```sql
-EXPLAIN SELECT * FROM products
-WHERE name LIKE '%samsung%'
-OR brand_name LIKE '%samsung%';
+EXPLAIN
+SELECT p.id, p.name, b.name AS brand_name
+FROM products p
+LEFT JOIN brands b ON b.id = p.id_brand
+WHERE p.name LIKE 'samsung%'
+OR b.name LIKE 'samsung%';
 ```
 
 Output yang mengkhawatirkan:
 
 ```
-+----+-------------+----------+------+---------------+------+---------+------+---------+-------------+
-| id | select_type | table    | type | possible_keys | key  | key_len | ref  | rows    | Extra       |
-+----+-------------+----------+------+---------------+------+---------+------+---------+-------------+
-|  1 | SIMPLE      | products | ALL  | NULL          | NULL | NULL    | NULL | 9876543 | Using where |
-+----+-------------+----------+------+---------------+------+---------+------+---------+-------------+
++----+-------------+-------+------+---------------+------+---------+------+---------+-------------+
+| id | select_type | table | type | possible_keys | key  | key_len | ref  | rows    | Extra       |
++----+-------------+-------+------+---------------+------+---------+------+---------+-------------+
+|  1 | SIMPLE      | p     | ALL  | NULL          | NULL | NULL    | NULL | 9876543 | Using where |
+|  1 | SIMPLE      | b     | ALL  | NULL          | NULL | NULL    | NULL |     250 | Using where |
++----+-------------+-------+------+---------------+------+---------+------+---------+-------------+
 ```
 
-- `type: ALL` → full table scan (sangat buruk)
-- `key: NULL` → tidak ada index yang digunakan
-- `rows: 9876543` → MySQL memeriksa hampir 10 juta baris
+- `type: ALL` di kedua tabel → full table scan di keduanya
+- `key: NULL` → index sama sekali tidak digunakan, meski sudah ada
+- MySQL harus memproses seluruh hasil JOIN (bisa miliaran kombinasi) sebelum mengevaluasi kondisi `OR`
+
+Bandingkan dengan query **tanpa OR** (hanya satu kondisi):
+
+```sql
+EXPLAIN SELECT * FROM products WHERE name LIKE 'samsung%';
+```
+
+```
++----+-------------+----------+-------+----------------+----------------+---------+------+------+-----------------------+
+| id | select_type | table    | type  | possible_keys  | key            | key_len | ref  | rows | Extra                 |
++----+-------------+----------+-------+----------------+----------------+---------+------+------+-----------------------+
+|  1 | SIMPLE      | products | range | idx_prod_name  | idx_prod_name  | 767     | NULL |  312 | Using index condition |
++----+-------------+----------+-------+----------------+----------------+---------+------+------+-----------------------+
+```
+
+- `type: range` → hanya scan sebagian index (sangat efisien)
+- `rows: 312` → MySQL hanya memeriksa 312 baris, bukan jutaan
 
 ### 3. OR dengan Banyak Kondisi Semakin Parah
 
 Semakin banyak kondisi `OR` yang ditambahkan, semakin berat beban yang harus ditanggung MySQL:
 
 ```sql
--- Makin banyak OR, makin lambat
+-- Makin banyak OR, makin lambat — bahkan dengan pola start-with sekalipun
 SELECT * FROM products
-WHERE name LIKE '%samsung%'
-OR brand_name LIKE '%samsung%'
-OR description LIKE '%samsung%'
-OR category LIKE '%samsung%'
-OR tags LIKE '%samsung%';
+WHERE name LIKE 'samsung%'
+OR brand_name LIKE 'samsung%'
+OR description LIKE 'samsung%'
+OR category LIKE 'samsung%'
+OR tags LIKE 'samsung%';
 ```
 
-Setiap tambahan kondisi `OR` meningkatkan kompleksitas query secara signifikan.
+Setiap tambahan kondisi `OR` meningkatkan kompleksitas query secara signifikan. MySQL harus mengevaluasi setiap kondisi untuk setiap baris, dan menggabungkan semua result set.
 
 ### 4. OR Bisa Merusak Urutan Eksekusi Query
 
@@ -102,11 +127,11 @@ Dalam query yang melibatkan `JOIN`, penggunaan `OR` dapat secara tidak sengaja m
 SELECT p.*, b.name AS brand_name
 FROM products p
 LEFT JOIN brands b ON b.id = p.id_brand
-WHERE p.name LIKE '%samsung%'
-OR b.name LIKE '%samsung%'; -- ini berlaku pada SEMUA baris, bukan hanya hasil JOIN
+WHERE p.name LIKE 'samsung%'
+OR b.name LIKE 'samsung%'; -- kondisi OR lintas tabel mengubah perilaku LEFT JOIN
 ```
 
-Query ini berpotensi mengembalikan data yang tidak diharapkan karena kondisi `OR` berlaku untuk seluruh hasil query, bukan hanya di dalam konteks JOIN tertentu.
+Query ini berpotensi mengembalikan data yang tidak diharapkan. Karena `OR` melibatkan kolom dari tabel yang di-LEFT JOIN, produk yang tidak memiliki brand (brand = NULL) bisa tetap muncul jika `p.name LIKE 'samsung%'` terpenuhi — dengan `brand_name` bernilai NULL. Sebaliknya, produk yang brandnya cocok tapi namanya tidak cocok juga akan muncul. Perilaku ini sering tidak sesuai ekspektasi dan sulit di-debug.
 
 ---
 
@@ -117,26 +142,26 @@ Query ini berpotensi mengembalikan data yang tidak diharapkan karena kondisi `OR
 **UNION ALL** memecah satu query besar dengan `OR` menjadi dua query terpisah yang masing-masing bisa memanfaatkan index-nya sendiri, lalu hasilnya digabungkan.
 
 ```sql
--- Sebelum (dengan OR - lambat):
+-- Sebelum (dengan OR - lambat, bahkan dengan start-with):
 SELECT p.id, p.name, b.name AS brand_name
 FROM products p
 LEFT JOIN brands b ON b.id = p.id_brand
-WHERE p.name LIKE '%samsung%'
-OR b.name LIKE '%samsung%';
+WHERE p.name LIKE 'samsung%'
+OR b.name LIKE 'samsung%';
 
 -- Sesudah (dengan UNION ALL - lebih cepat):
 SELECT p.id, p.name, b.name AS brand_name
 FROM products p
 LEFT JOIN brands b ON b.id = p.id_brand
-WHERE p.name LIKE '%samsung%'
+WHERE p.name LIKE 'samsung%'
 
 UNION ALL
 
 SELECT p.id, p.name, b.name AS brand_name
 FROM products p
 LEFT JOIN brands b ON b.id = p.id_brand
-WHERE b.name LIKE '%samsung%'
-AND p.name NOT LIKE '%samsung%'; -- hindari duplikat
+WHERE b.name LIKE 'samsung%'
+AND p.name NOT LIKE 'samsung%'; -- hindari duplikat
 ```
 
 **Keuntungan UNION ALL:**
@@ -152,7 +177,7 @@ AND p.name NOT LIKE '%samsung%'; -- hindari duplikat
 
 ### Solusi 2: Gunakan FULLTEXT Search (Rekomendasi untuk Pencarian Teks)
 
-MySQL memiliki fitur **FULLTEXT Index** yang dirancang khusus untuk pencarian teks. Ini jauh lebih cepat dibandingkan `LIKE '%...%'` untuk kebutuhan pencarian kata kunci.
+MySQL memiliki fitur **FULLTEXT Index** yang dirancang khusus untuk pencarian teks. Ini jauh lebih cepat dibandingkan `OR` + `LIKE 'kata%'` lintas kolom, terutama untuk kebutuhan pencarian kata kunci dari banyak kolom.
 
 **Langkah 1: Buat FULLTEXT Index**
 
@@ -165,7 +190,7 @@ ALTER TABLE brands ADD FULLTEXT INDEX ft_brand_search (name);
 **Langkah 2: Gunakan MATCH...AGAINST**
 
 ```sql
--- Pencarian menggunakan FULLTEXT (jauh lebih cepat dari OR + LIKE)
+-- Pencarian menggunakan FULLTEXT (jauh lebih cepat dari OR + LIKE 'kata%')
 SELECT p.id, p.name, b.name AS brand_name
 FROM products p
 LEFT JOIN brands b ON b.id = p.id_brand
@@ -273,7 +298,7 @@ OR name = 'iPhone 15';
 
 Jika output menunjukkan `type: index_merge` dan `Extra: Using union(idx_product_name,idx_product_name)`, berarti MySQL sudah menggunakan beberapa index sekaligus.
 
-**Catatan penting:** Index Merge hanya efektif untuk pencarian dengan nilai *pasti* (equality), bukan untuk `LIKE '%...%'` dengan wildcard di depan.
+**Catatan penting:** Index Merge bisa bekerja untuk range scan seperti `LIKE 'kata%'` dalam **satu tabel**. Namun ketika `OR` menyeberang ke tabel lain melalui JOIN, Index Merge tidak lagi berlaku dan MySQL akan fallback ke full scan.
 
 ---
 
@@ -308,9 +333,9 @@ Berikut perbandingan estimasi performa untuk tabel dengan **1 juta baris**:
 
 | Metode Query | Waktu Eksekusi | Index Digunakan | Catatan |
 |---|---|---|---|
-| `OR` + `LIKE '%...%'` | ~3000 ms | Tidak | Full table scan |
-| `UNION ALL` + `LIKE '%...%'` | ~2500 ms | Sebagian | Masih ada wildcard prefix |
-| `LIKE 'kata%'` (tanpa prefix wildcard) | ~50 ms | Ya | Hanya cocok jika pencarian dari awal kata |
+| `OR` + `LIKE 'kata%'` (lintas tabel JOIN) | ~3000 ms | Tidak | Full scan karena OR lintas JOIN |
+| `OR` + `LIKE 'kata%'` (satu tabel, Index Merge) | ~800 ms | Sebagian | Index Merge, tapi ada overhead merge |
+| `UNION ALL` + `LIKE 'kata%'` | ~100 ms | Ya (range) | Setiap sub-query pakai index sendiri |
 | `MATCH...AGAINST` (FULLTEXT) | ~10 ms | Ya (FULLTEXT) | Optimal untuk pencarian teks bebas |
 | Hasil dari cache | < 5 ms | - | Tidak menyentuh database |
 
@@ -318,13 +343,13 @@ Berikut perbandingan estimasi performa untuk tabel dengan **1 juta baris**:
 
 ## Kesimpulan
 
-Penggunaan operator `OR` dalam query pencarian MySQL adalah pola yang mudah ditulis tetapi bermasalah di skala besar. Berikut rangkuman rekomendasi:
+Penggunaan operator `OR` dalam query pencarian MySQL adalah pola yang mudah ditulis tetapi bermasalah di skala besar. **Ini berlaku bahkan ketika sudah menggunakan pola *start-with* (`LIKE 'kata%'`)** — karena akar masalahnya bukan hanya pada pola `LIKE`, melainkan pada kemampuan MySQL menggunakan index saat kondisi `OR` tersebar di beberapa kolom atau lintas tabel JOIN. Berikut rangkuman rekomendasi:
 
-1. **Hindari `LIKE '%kata%'`** — prefix wildcard selalu menyebabkan full scan. Gunakan FULLTEXT sebagai gantinya.
+1. **Hindari `OR` lintas kolom/tabel untuk pencarian** — meski masing-masing kolom punya index dan sudah pakai `LIKE 'kata%'`, OR tetap memaksa full scan atau overhead Index Merge yang berat.
 
-2. **Gunakan FULLTEXT Index** — ini adalah solusi terbaik untuk kebutuhan pencarian teks bebas (*full-text search*) di MySQL.
+2. **Gunakan FULLTEXT Index** — ini adalah solusi terbaik untuk kebutuhan pencarian teks dari banyak kolom sekaligus di MySQL.
 
-3. **Gunakan UNION ALL** sebagai alternatif `OR` ketika FULLTEXT tidak memungkinkan — setiap sub-query dapat dioptimalkan secara independen.
+3. **Gunakan UNION ALL** sebagai alternatif `OR` ketika FULLTEXT tidak memungkinkan — setiap sub-query dapat dioptimalkan secara independen dengan index range scan.
 
 4. **Selalu gunakan EXPLAIN** untuk menganalisis query sebelum deploy ke production — pastikan `type` bukan `ALL` dan `key` tidak `NULL`.
 
@@ -332,4 +357,4 @@ Penggunaan operator `OR` dalam query pencarian MySQL adalah pola yang mudah ditu
 
 6. **Mulai migrasi secara bertahap** — tidak perlu mengubah semua query sekaligus. Prioritaskan query yang paling sering dijalankan dan paling lambat.
 
-> **Prinsip utama:** Buat MySQL bekerja sesedikit mungkin dengan memastikan setiap query memanfaatkan index yang tepat.
+> **Prinsip utama:** Buat MySQL bekerja sesedikit mungkin dengan memastikan setiap query memanfaatkan index yang tepat — `OR` lintas kolom sering kali mencegah hal itu terjadi.
