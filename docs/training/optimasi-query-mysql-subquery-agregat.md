@@ -1,6 +1,6 @@
 # Modul Training: Optimasi Query MySQL — Subquery dengan Fungsi Agregat
 
-**Topik:** Optimasi Query MySQL — Subquery Berkorelasi vs JOIN + GROUP BY  
+**Topik:** Optimasi Query MySQL — Subquery Berkorelasi vs Derived Table / CTE  
 **Level:** Intermediate  
 **Estimasi Waktu:** 60–90 menit
 
@@ -11,7 +11,10 @@
 1. [Pendahuluan](#1-pendahuluan)
 2. [Studi Kasus: Query yang Bermasalah](#2-studi-kasus-query-yang-bermasalah)
 3. [Mengapa Subquery Berkorelasi Tidak Disarankan](#3-mengapa-subquery-berkorelasi-tidak-disarankan)
-4. [Solusi: Rewrite dengan LEFT JOIN + GROUP BY](#4-solusi-rewrite-dengan-left-join--group-by)
+4. [Solusi yang Direkomendasikan](#4-solusi-yang-direkomendasikan)
+   - [4.1 Derived Table (Pre-Aggregate) — Paling Ringan](#41-derived-table-pre-aggregate--paling-ringan)
+   - [4.2 CTE (MySQL 8.0+) — Alternatif Modern](#42-cte-mysql-80--alternatif-modern)
+   - [4.3 LEFT JOIN + GROUP BY — Alternatif Lain](#43-left-join--group-by--alternatif-lain)
 5. [Perbandingan Rencana Eksekusi (EXPLAIN)](#5-perbandingan-rencana-eksekusi-explain)
 6. [Rekomendasi Indeks](#6-rekomendasi-indeks)
 7. [Contoh Kasus Tambahan](#7-contoh-kasus-tambahan)
@@ -32,7 +35,7 @@ Salah satu cara yang sering ditulis oleh developer adalah meletakkan fungsi agre
 
 Modul ini membahas:
 1. Mengapa subquery berkorelasi dengan agregat **tidak disarankan**
-2. Solusi penulisan query yang mencapai tujuan yang sama namun jauh lebih efisien
+2. Solusi penulisan query yang mencapai tujuan yang sama namun jauh lebih efisien, termasuk alternatif yang **lebih ringan dari `GROUP BY`**
 
 ### Skema Tabel yang Digunakan
 
@@ -169,79 +172,128 @@ Semakin banyak baris `PRIMARY`, semakin banyak kali `DEPENDENT SUBQUERY` dieksek
 
 ---
 
-## 4. Solusi: Rewrite dengan LEFT JOIN + GROUP BY
+## 4. Solusi yang Direkomendasikan
 
-### 4.1 Query yang Dioptimalkan
+Ada tiga pendekatan yang dapat digunakan. Ketiganya jauh lebih baik dari subquery berkorelasi, namun masing-masing memiliki perbedaan bobot eksekusi.
+
+| Pendekatan | Klausa Kunci | `Using temporary` di EXPLAIN | Keterangan |
+|---|---|:---:|---|
+| **Derived Table** | `LEFT JOIN (SELECT … GROUP BY)` | ❌ Tidak | **Terbaik** — GROUP BY hanya pada tabel kecil agregat |
+| **CTE** | `WITH … AS (SELECT … GROUP BY)` | ❌ Tidak | Sama dengan Derived Table, lebih mudah dibaca (MySQL 8.0+) |
+| LEFT JOIN + GROUP BY | `LEFT JOIN … GROUP BY` pada query utama | ✅ Ya | Masih baik, namun lebih berat jika baris hasil besar |
+
+---
+
+### 4.1 Derived Table (Pre-Aggregate) — Paling Ringan
+
+**Ide utama:** agregasi dilakukan **dulu** di dalam sebuah subquery di klausa `FROM` (disebut *derived table* atau *inline view*), menghasilkan satu baris per produk. Hasilnya baru di-`JOIN` ke tabel `product`. Dengan cara ini, query luar **tidak perlu `GROUP BY` sama sekali**.
 
 ```sql
 SELECT
     p.name,
     p.price,
-    COUNT(ipm.id)             AS total_bought,
+    COALESCE(agg.total_bought, 0) AS total_bought,
+    COALESCE(agg.total_amount, 0) AS total_amount
+FROM product AS p
+LEFT JOIN (
+    SELECT
+        pid,
+        COUNT(*)   AS total_bought,
+        SUM(price) AS total_amount
+    FROM inv_product_map
+    GROUP BY pid              -- GROUP BY hanya di sini, pada satu tabel kecil
+) AS agg ON agg.pid = p.id;
+```
+
+#### Cara MySQL Mengeksekusinya
+
+```
+1. MySQL menjalankan derived table SATU KALI:
+   → Baca seluruh inv_product_map, GROUP BY pid
+   → Hasilnya: 1 baris per produk (tabel kecil "agg")
+
+2. MySQL men-JOIN tabel product dengan "agg" (1:1 atau 1:0):
+   → Tidak ada GROUP BY pada query luar
+   → Tidak ada sorting/temporary table pada query luar
+```
+
+#### Kenapa Lebih Ringan dari `LEFT JOIN + GROUP BY` pada Query Utama?
+
+Saat menggunakan `LEFT JOIN + GROUP BY` langsung di query utama, MySQL harus:
+
+1. Membangun hasil JOIN terlebih dahulu (bisa ribuan baris: N produk × M transaksi per produk)
+2. Baru men-sort dan mengelompokkan hasil JOIN yang besar itu → **`Using temporary; Using filesort`**
+
+Dengan derived table, `GROUP BY` hanya berjalan pada `inv_product_map` saja — tabel tunggal yang lebih kecil — dan hasilnya sudah tereduksi menjadi **1 baris per produk** sebelum di-JOIN. Query luar tinggal melakukan simple 1:1 lookup.
+
+#### Penjelasan Klausa `COALESCE`
+
+```sql
+COALESCE(agg.total_bought, 0) AS total_bought
+COALESCE(agg.total_amount, 0) AS total_amount
+```
+
+Jika sebuah produk tidak memiliki transaksi sama sekali, `LEFT JOIN` menghasilkan `NULL` untuk semua kolom `agg`. `COALESCE` mengubah `NULL` tersebut menjadi `0`.
+
+> Perhatikan: di dalam derived table kita menggunakan `COUNT(*)` karena kita sudah memfilter pada tabel `inv_product_map` saja — tidak ada baris NULL palsu akibat `LEFT JOIN` di sini.
+
+---
+
+### 4.2 CTE (MySQL 8.0+) — Alternatif Modern
+
+**CTE** (*Common Table Expression*) menggunakan klausa `WITH` untuk mendefinisikan hasil sementara bernama. Secara logis dan performa, CTE identik dengan derived table — hanya berbeda dalam keterbacaan.
+
+```sql
+WITH agg AS (
+    SELECT
+        pid,
+        COUNT(*)   AS total_bought,
+        SUM(price) AS total_amount
+    FROM inv_product_map
+    GROUP BY pid
+)
+SELECT
+    p.name,
+    p.price,
+    COALESCE(agg.total_bought, 0) AS total_bought,
+    COALESCE(agg.total_amount, 0) AS total_amount
+FROM product AS p
+LEFT JOIN agg ON agg.pid = p.id;
+```
+
+**Keunggulan CTE dibanding Derived Table:**
+- Lebih mudah dibaca dan di-maintain, terutama bila ada banyak agregat
+- CTE bisa dirujuk berkali-kali jika diperlukan (menghindari pengulangan kode)
+- Lebih mudah di-debug: bisa dijalankan bagian `WITH`-nya secara terpisah
+
+**Syarat:** Membutuhkan **MySQL 8.0+** atau MariaDB 10.2.1+. Untuk MySQL 5.7 ke bawah, gunakan derived table (4.1).
+
+---
+
+### 4.3 LEFT JOIN + GROUP BY — Alternatif Lain
+
+Pendekatan ini tetap valid, terutama bila sudah ada indeks yang baik pada kolom JOIN. Namun `GROUP BY` bekerja pada **hasil JOIN** (bisa berisi banyak baris), sehingga MySQL sering menghasilkan `Using temporary; Using filesort` pada query luar.
+
+```sql
+SELECT
+    p.name,
+    p.price,
+    COUNT(ipm.id)               AS total_bought,
     COALESCE(SUM(ipm.price), 0) AS total_amount
 FROM product AS p
 LEFT JOIN inv_product_map AS ipm ON ipm.pid = p.id
 GROUP BY p.id, p.name, p.price;
 ```
 
-### 4.2 Cara MySQL Mengeksekusinya
+**Kapan tetap memilih pendekatan ini:**
+- Versi MySQL < 5.7 (derived table tetap didukung, tetapi CTE tidak)
+- Query sangat sederhana (hanya 2 tabel, satu tingkat GROUP BY)
+- Tim sudah familiar dan indeks sudah lengkap
 
-Berbeda dengan subquery berkorelasi, query ini dieksekusi dalam **satu kali pass**:
-
-```
-1. MySQL melakukan JOIN antara tabel product dan inv_product_map satu kali
-2. Untuk setiap grup (p.id), MySQL menghitung COUNT dan SUM sekaligus
-3. Hasilnya dikembalikan dalam satu set hasil
-```
-
-| Jumlah baris di `product` | Total eksekusi SQL |
-|:---:|:---:|
-| 100 | **1** |
-| 1.000 | **1** |
-| 10.000 | **1** |
-| 100.000 | **1** |
-
-Tidak peduli seberapa besar tabelnya, query ini **selalu hanya 1 operasi**.
-
-### 4.3 Penjelasan Setiap Klausa
-
-#### `LEFT JOIN` — Bukan `INNER JOIN`
-
-```sql
-LEFT JOIN inv_product_map AS ipm ON ipm.pid = p.id
-```
-
-Gunakan `LEFT JOIN` agar produk yang **belum pernah dibeli** tetap muncul di hasil dengan nilai `NULL` (yang kemudian dikonversi menjadi `0` oleh `COALESCE`).
-
-Jika menggunakan `INNER JOIN`, produk tanpa transaksi akan hilang dari hasil — berbeda dengan perilaku subquery berkorelasi yang akan mengembalikan `0` untuk produk tersebut.
-
-#### `GROUP BY` — Mengelompokkan per Produk
-
-```sql
-GROUP BY p.id, p.name, p.price
-```
-
-`GROUP BY` memastikan bahwa fungsi agregat `COUNT` dan `SUM` dihitung per produk. Sertakan semua kolom non-agregat yang ada di `SELECT` dalam klausa `GROUP BY` agar kompatibel dengan semua konfigurasi MySQL (termasuk mode `ONLY_FULL_GROUP_BY`).
-
-> **Catatan:** Pada MySQL 5.7.5+, karena `p.id` adalah `PRIMARY KEY`, secara teknis cukup menulis `GROUP BY p.id` saja. Namun, menyertakan semua kolom yang di-`SELECT` lebih eksplisit dan portabel.
-
-#### `COUNT(ipm.id)` — Bukan `COUNT(*)`
-
-```sql
-COUNT(ipm.id) AS total_bought
-```
-
-`COUNT(ipm.id)` hanya menghitung baris di mana `ipm.id` **tidak NULL**. Ini penting karena `LEFT JOIN` pada produk tanpa transaksi menghasilkan baris dengan semua kolom `ipm` bernilai `NULL`. Dengan `COUNT(ipm.id)`, produk tanpa transaksi akan mendapat nilai `0` — perilaku yang sama dengan subquery berkorelasi.
-
-Jika menggunakan `COUNT(*)`, semua baris (termasuk baris NULL dari `LEFT JOIN`) akan dihitung, sehingga produk tanpa transaksi mendapat nilai `1` — **tidak sesuai**.
-
-#### `COALESCE(SUM(ipm.price), 0)` — Tangani NULL
-
-```sql
-COALESCE(SUM(ipm.price), 0) AS total_amount
-```
-
-Ketika tidak ada baris yang cocok setelah `LEFT JOIN`, `SUM(ipm.price)` mengembalikan `NULL`. `COALESCE` mengkonversi `NULL` tersebut menjadi `0`, sehingga hasil lebih bersih dan mudah diproses oleh aplikasi.
+**Kapan lebih baik beralih ke Derived Table / CTE:**
+- Banyak kolom di `GROUP BY` (kinerja sort semakin berat)
+- Hasil JOIN besar (banyak produk × banyak transaksi per produk)
+- Ada beberapa agregat berbeda dari tabel yang sama
 
 ---
 
@@ -275,7 +327,42 @@ FROM product AS p;
 
 ---
 
-### EXPLAIN — Query Optimal (LEFT JOIN + GROUP BY)
+### EXPLAIN — Derived Table (Pendekatan Terbaik)
+
+```sql
+EXPLAIN
+SELECT
+    p.name, p.price,
+    COALESCE(agg.total_bought, 0) AS total_bought,
+    COALESCE(agg.total_amount, 0) AS total_amount
+FROM product AS p
+LEFT JOIN (
+    SELECT pid, COUNT(*) AS total_bought, SUM(price) AS total_amount
+    FROM inv_product_map
+    GROUP BY pid
+) AS agg ON agg.pid = p.id;
+```
+
+```
++----+-------------+------------------+------+---------------+---------+--------+--------+------+--------------------+
+| id | select_type | table            | type | possible_keys | key     | key_len| ref    | rows | Extra              |
++----+-------------+------------------+------+---------------+---------+--------+--------+------+--------------------+
+|  1 | PRIMARY     | p                | ALL  | NULL          | NULL    | NULL   | NULL   | 1000 | NULL               |
+|  1 | PRIMARY     | <derived2>       | ref  | <auto_key0>   | auto0   | 4      | p.id   |   10 | NULL               |
+|  2 | DERIVED     | inv_product_map  | ALL  | idx_pid       | idx_pid | NULL   | NULL   | 5000 | Using index        |
++----+-------------+------------------+------+---------------+---------+--------+--------+------+--------------------+
+```
+
+**Yang perlu diperhatikan:**
+- `select_type = DERIVED` → subquery di `FROM` dieksekusi **satu kali**, hasilnya disimpan sebagai tabel sementara kecil
+- `select_type = PRIMARY` pada baris `p` dan `<derived2>` → keduanya bagian dari query luar yang sederhana
+- **Tidak ada** `DEPENDENT SUBQUERY` → tidak ada eksekusi berulang
+- Tidak ada `Using temporary; Using filesort` pada query luar (baris `p`) → **tidak ada sort/grouping pada hasil JOIN**
+- `GROUP BY` hanya terjadi di dalam derived table (baris `inv_product_map`), bukan pada hasil JOIN yang besar
+
+---
+
+### EXPLAIN — LEFT JOIN + GROUP BY (Alternatif Lain)
 
 ```sql
 EXPLAIN
@@ -298,22 +385,24 @@ GROUP BY p.id, p.name, p.price;
 ```
 
 **Yang perlu diperhatikan:**
-- `select_type = SIMPLE` → tidak ada subquery berkorelasi
-- Hanya **2 baris** dalam EXPLAIN (kedua tabel di-JOIN sekaligus)
-- `key = idx_pid` pada baris `ipm` → MySQL menggunakan indeks saat JOIN
-- Kedua baris memiliki `id = 1` → bagian dari **satu operasi yang sama**
+- `select_type = SIMPLE` → tidak ada subquery berkorelasi ✅
+- Hanya **2 baris** dalam EXPLAIN (kedua tabel di-JOIN sekaligus) ✅
+- Namun: **`Using temporary; Using filesort`** pada baris `p` → MySQL membangun tabel sementara dari seluruh hasil JOIN, lalu men-sort-nya untuk GROUP BY ⚠️
 
 ---
 
 ### Rangkuman Perbandingan
 
-| Aspek | Subquery Berkorelasi | LEFT JOIN + GROUP BY |
-|---|---|---|
-| `select_type` | `DEPENDENT SUBQUERY` | `SIMPLE` |
-| Jumlah eksekusi SQL | 2N + 1 | **1** |
-| Bisa memanfaatkan cache hasil | ❌ Tidak | ✅ Ya |
-| Skalabilitas pada data besar | ❌ Buruk | ✅ Baik |
-| Produk tanpa transaksi muncul | ✅ Ya (nilai 0) | ✅ Ya (dengan `LEFT JOIN` + `COALESCE`) |
+| Aspek | Subquery Berkorelasi | Derived Table / CTE | LEFT JOIN + GROUP BY |
+|---|---|---|---|
+| `select_type` | `DEPENDENT SUBQUERY` | `DERIVED` + `PRIMARY` | `SIMPLE` |
+| Jumlah eksekusi SQL | 2N + 1 | **1** | **1** |
+| `Using temporary; Using filesort` (outer) | ❌ N/A | ✅ Tidak ada | ⚠️ Ada |
+| GROUP BY diterapkan pada | N/A | Tabel kecil (pre-agregat) | Hasil JOIN yang besar |
+| Bisa memanfaatkan cache hasil | ❌ Tidak | ✅ Ya | ✅ Ya |
+| Skalabilitas pada data besar | ❌ Buruk | ✅ Terbaik | ✅ Baik |
+| Produk tanpa transaksi muncul | ✅ Ya (nilai 0) | ✅ Ya (dengan `COALESCE`) | ✅ Ya (dengan `COALESCE`) |
+| Versi MySQL minimum | Semua | 5.x (derived table) / 8.0+ (CTE) | Semua |
 
 ---
 
@@ -366,24 +455,44 @@ SELECT
 FROM product AS p;
 ```
 
-**Solusi — JOIN dengan filter:**
+**Solusi — Derived Table dengan filter di dalam pre-agregat:**
 
 ```sql
 SELECT
     p.name,
-    COUNT(ipm.id) AS total_bought_2024
+    COALESCE(agg.total_bought_2024, 0) AS total_bought_2024
 FROM product AS p
-LEFT JOIN inv_product_map AS ipm
-       ON ipm.pid = p.id
-      AND YEAR(ipm.created_at) = 2024   -- filter dipindah ke kondisi JOIN
-GROUP BY p.id, p.name;
+LEFT JOIN (
+    SELECT
+        pid,
+        COUNT(*) AS total_bought_2024
+    FROM inv_product_map
+    WHERE YEAR(created_at) = 2024   -- filter dilakukan sebelum agregasi
+    GROUP BY pid
+) AS agg ON agg.pid = p.id;
 ```
 
-> **Perhatikan:** Kondisi filter (`YEAR(ipm.created_at) = 2024`) diletakkan di klausa `ON`, **bukan** di `WHERE`. Jika diletakkan di `WHERE`, baris produk tanpa transaksi di tahun 2024 akan ikut terfilter dan tidak muncul di hasil.
+Filter diletakkan di dalam derived table (klausa `WHERE` di dalam subquery `FROM`), bukan di query luar. Produk yang tidak memiliki transaksi di tahun 2024 tetap muncul karena `LEFT JOIN` pada query luar.
+
+**Alternatif dengan CTE (MySQL 8.0+):**
+
+```sql
+WITH agg AS (
+    SELECT pid, COUNT(*) AS total_bought_2024
+    FROM inv_product_map
+    WHERE YEAR(created_at) = 2024
+    GROUP BY pid
+)
+SELECT
+    p.name,
+    COALESCE(agg.total_bought_2024, 0) AS total_bought_2024
+FROM product AS p
+LEFT JOIN agg ON agg.pid = p.id;
+```
 
 ---
 
-### 7.2 Beberapa Tabel Agregat Sekaligus
+### 7.2 Beberapa Agregat Sekaligus
 
 **Masalah — Banyak subquery:**
 
@@ -399,27 +508,38 @@ FROM product AS p;
 -- 5 subquery berkorelasi → 5N + 1 operasi
 ```
 
-**Solusi — Semua agregat sekaligus dalam satu JOIN:**
+**Solusi — Semua agregat dalam satu derived table:**
 
 ```sql
 SELECT
     p.name,
-    COUNT(ipm.id)               AS total_bought,
-    COALESCE(SUM(ipm.price), 0) AS total_amount,
-    MAX(ipm.price)              AS max_price,
-    MIN(ipm.price)              AS min_price,
-    AVG(ipm.price)              AS avg_price
+    COALESCE(agg.total_bought, 0) AS total_bought,
+    COALESCE(agg.total_amount, 0) AS total_amount,
+    agg.max_price,
+    agg.min_price,
+    agg.avg_price
 FROM product AS p
-LEFT JOIN inv_product_map AS ipm ON ipm.pid = p.id
-GROUP BY p.id, p.name;
--- 1 operasi, semua agregat dihitung sekaligus
+LEFT JOIN (
+    SELECT
+        pid,
+        COUNT(*)   AS total_bought,
+        SUM(price) AS total_amount,
+        MAX(price) AS max_price,
+        MIN(price) AS min_price,
+        AVG(price) AS avg_price
+    FROM inv_product_map
+    GROUP BY pid
+) AS agg ON agg.pid = p.id;
+-- 1 operasi, semua agregat dihitung sekaligus di derived table
 ```
+
+Semua fungsi agregat dituliskan di dalam satu derived table — tidak ada `GROUP BY` pada query luar sama sekali.
 
 ---
 
 ### 7.3 Agregat dari Dua Tabel Berbeda
 
-Kadang kita perlu agregat dari dua tabel yang berbeda sekaligus.
+Ketika perlu agregat dari dua tabel yang berbeda sekaligus, buat **dua derived table terpisah** lalu gabungkan.
 
 ```sql
 -- Contoh: jumlah review dan total pembelian per produk
@@ -427,16 +547,26 @@ Kadang kita perlu agregat dari dua tabel yang berbeda sekaligus.
 
 SELECT
     p.name,
-    COUNT(DISTINCT ipm.id)    AS total_bought,
-    COUNT(DISTINCT rev.id)    AS total_reviews,
-    AVG(rev.rating)           AS avg_rating
+    COALESCE(buy.total_bought, 0)  AS total_bought,
+    COALESCE(rev.total_reviews, 0) AS total_reviews,
+    rev.avg_rating
 FROM product AS p
-LEFT JOIN inv_product_map AS ipm ON ipm.pid = p.id
-LEFT JOIN product_reviews  AS rev ON rev.pid = p.id
-GROUP BY p.id, p.name;
+LEFT JOIN (
+    SELECT pid, COUNT(*) AS total_bought
+    FROM inv_product_map
+    GROUP BY pid
+) AS buy ON buy.pid = p.id
+LEFT JOIN (
+    SELECT pid, COUNT(*) AS total_reviews, AVG(rating) AS avg_rating
+    FROM product_reviews
+    GROUP BY pid
+) AS rev ON rev.pid = p.id;
 ```
 
-> **Perhatian:** Ketika men-JOIN dua tabel yang masing-masing memiliki banyak baris per produk, bisa terjadi **duplikasi** yang memengaruhi hasil COUNT. Gunakan `COUNT(DISTINCT kolom)` untuk menghindari penghitungan ganda.
+Keunggulan pendekatan ini dibanding satu `JOIN` besar + `GROUP BY`:
+- Setiap derived table mereduksi datanya menjadi satu baris per produk sebelum di-JOIN
+- Tidak ada risiko **duplikasi** baris akibat JOIN dua tabel multi-baris (masalah Cartesian partial)
+- Tidak perlu `COUNT(DISTINCT ...)` seperti pada pendekatan JOIN langsung
 
 ---
 
@@ -464,14 +594,35 @@ FROM customer AS c;
 <details>
 <summary>💡 Lihat Jawaban</summary>
 
+**Pendekatan Derived Table (direkomendasikan):**
+
 ```sql
 SELECT
     c.name,
-    COUNT(o.id)               AS total_orders,
-    COALESCE(SUM(o.total), 0) AS total_spent
+    COALESCE(agg.total_orders, 0) AS total_orders,
+    COALESCE(agg.total_spent, 0)  AS total_spent
 FROM customer AS c
-LEFT JOIN orders AS o ON o.customer_id = c.id
-GROUP BY c.id, c.name;
+LEFT JOIN (
+    SELECT customer_id, COUNT(*) AS total_orders, SUM(total) AS total_spent
+    FROM orders
+    GROUP BY customer_id
+) AS agg ON agg.customer_id = c.id;
+```
+
+**Alternatif CTE (MySQL 8.0+):**
+
+```sql
+WITH agg AS (
+    SELECT customer_id, COUNT(*) AS total_orders, SUM(total) AS total_spent
+    FROM orders
+    GROUP BY customer_id
+)
+SELECT
+    c.name,
+    COALESCE(agg.total_orders, 0) AS total_orders,
+    COALESCE(agg.total_spent, 0)  AS total_spent
+FROM customer AS c
+LEFT JOIN agg ON agg.customer_id = c.id;
 ```
 
 </details>
@@ -486,19 +637,23 @@ Dari query yang sudah dioptimalkan pada Soal 1, tambahkan kondisi:
 <details>
 <summary>💡 Lihat Jawaban</summary>
 
+**Pendekatan Derived Table:**
+
 ```sql
 SELECT
     c.name,
-    COUNT(o.id)               AS total_completed_orders,
-    COALESCE(SUM(o.total), 0) AS total_spent
+    COALESCE(agg.total_completed_orders, 0) AS total_completed_orders,
+    COALESCE(agg.total_spent, 0)            AS total_spent
 FROM customer AS c
-LEFT JOIN orders AS o
-       ON o.customer_id = c.id
-      AND o.status = 'completed'   -- filter di ON, bukan WHERE
-GROUP BY c.id, c.name;
+LEFT JOIN (
+    SELECT customer_id, COUNT(*) AS total_completed_orders, SUM(total) AS total_spent
+    FROM orders
+    WHERE status = 'completed'   -- filter di dalam derived table sebelum agregasi
+    GROUP BY customer_id
+) AS agg ON agg.customer_id = c.id;
 ```
 
-Jika filter diletakkan di `WHERE o.status = 'completed'`, pelanggan tanpa pesanan `completed` akan hilang dari hasil karena `NULL` tidak memenuhi kondisi `WHERE`.
+Filter `status = 'completed'` diletakkan di dalam `WHERE` pada derived table. Pelanggan tanpa pesanan berstatus `completed` tetap muncul karena `LEFT JOIN` di query luar menghasilkan `NULL` untuk kolom `agg`, lalu `COALESCE` mengubahnya menjadi `0`.
 
 </details>
 
@@ -522,17 +677,22 @@ FROM product p;
 
 **Masalah:** Subquery berkorelasi yang mereferensikan `p.id` dan melakukan JOIN internal — dieksekusi N kali.
 
-**Solusi:**
+**Solusi dengan Derived Table:**
 
 ```sql
 SELECT
     p.name,
-    COUNT(oi.id) AS paid_count
+    COALESCE(agg.paid_count, 0) AS paid_count
 FROM product AS p
-LEFT JOIN order_items AS oi ON oi.product_id = p.id
-LEFT JOIN orders      AS o  ON o.id = oi.order_id AND o.status = 'paid'
-GROUP BY p.id, p.name;
+LEFT JOIN (
+    SELECT oi.product_id, COUNT(*) AS paid_count
+    FROM order_items AS oi
+    INNER JOIN orders AS o ON o.id = oi.order_id AND o.status = 'paid'
+    GROUP BY oi.product_id
+) AS agg ON agg.product_id = p.id;
 ```
+
+Aggregasi `order_items` bersama kondisi `status = 'paid'` dilakukan **satu kali** di dalam derived table, menghasilkan satu baris per produk. Query luar hanya melakukan simple JOIN terhadap hasil kecil tersebut.
 
 </details>
 
@@ -544,25 +704,31 @@ GROUP BY p.id, p.name;
 
 > ❌ **Hindari** menempatkan subquery berkorelasi yang mengandung fungsi agregat (`COUNT`, `SUM`, `AVG`, `MAX`, `MIN`) di dalam klausa `SELECT`.
 
-> ✅ **Gunakan** `LEFT JOIN` + `GROUP BY` sebagai gantinya.
+> ✅ **Gunakan Derived Table** — pre-agregasi di dalam subquery `FROM`, lalu `LEFT JOIN` hasilnya ke tabel utama.  
+> ✅ **Gunakan CTE** (MySQL 8.0+) sebagai alternatif Derived Table yang lebih mudah dibaca.  
+> ✅ **LEFT JOIN + GROUP BY** masih merupakan pilihan valid, namun lebih berat karena `GROUP BY` diterapkan pada hasil JOIN yang lebih besar.
 
 ### Checklist Optimasi
 
-- [ ] Periksa apakah ada `DEPENDENT SUBQUERY` pada output `EXPLAIN`
-- [ ] Ganti setiap subquery agregat berkorelasi dengan `LEFT JOIN` + agregat di `SELECT`
-- [ ] Gunakan `COUNT(kolom)` bukan `COUNT(*)` agar produk/entitas tanpa data terkait mendapat nilai `0`
-- [ ] Bungkus `SUM()` dan `AVG()` dengan `COALESCE(..., 0)` untuk menghindari hasil `NULL`
+- [ ] Periksa apakah ada `DEPENDENT SUBQUERY` pada output `EXPLAIN` → ganti dengan Derived Table atau CTE
+- [ ] Periksa apakah ada `Using temporary; Using filesort` pada query luar → pertimbangkan Derived Table / CTE
+- [ ] Letakkan `GROUP BY` hanya di dalam derived table (pada tabel anak), **bukan** di query luar
+- [ ] Gunakan `LEFT JOIN` agar entitas induk tanpa data anak tetap muncul
+- [ ] Bungkus kolom dari derived table dengan `COALESCE(..., 0)` untuk menangani `NULL`
 - [ ] Pastikan kolom JOIN memiliki **indeks** (`INDEX idx_pid (pid)`)
-- [ ] Letakkan filter kondisional di klausa `ON` (bukan `WHERE`) jika ingin tetap menampilkan baris induk yang tidak cocok
+- [ ] Untuk filter kondisional, letakkan klausa `WHERE` di dalam derived table (bukan di query luar)
+- [ ] Untuk dua sumber agregat berbeda, gunakan **dua derived table terpisah** untuk menghindari duplikasi
 - [ ] Jalankan `EXPLAIN` sebelum dan sesudah optimasi untuk memverifikasi perbaikan
 
 ### Tabel Referensi Cepat
 
-| Situasi | Rekomendasi |
+| Situasi | Pendekatan yang Direkomendasikan |
 |---|---|
-| Hitung jumlah anak per induk | `COUNT(child.id)` dengan `LEFT JOIN` + `GROUP BY` |
-| Jumlahkan nilai dari tabel anak | `COALESCE(SUM(child.amount), 0)` dengan `LEFT JOIN` + `GROUP BY` |
-| Filter pada tabel anak tapi induk tetap muncul | Kondisi di klausa `ON`, bukan `WHERE` |
-| Banyak agregat dari tabel yang sama | Satu `LEFT JOIN` dengan beberapa fungsi agregat sekaligus |
-| Banyak agregat dari tabel berbeda | Beberapa `LEFT JOIN` + `COUNT(DISTINCT ...)` untuk menghindari duplikasi |
-| Verifikasi rencana eksekusi | Gunakan `EXPLAIN` dan cari baris `DEPENDENT SUBQUERY` |
+| Hitung jumlah anak per induk | Derived Table: `COUNT(*) … GROUP BY` di dalam subquery `FROM` |
+| Jumlahkan nilai dari tabel anak | Derived Table: `SUM(amount) … GROUP BY` + `COALESCE` di luar |
+| Banyak agregat dari tabel yang sama | Satu Derived Table dengan beberapa fungsi agregat |
+| Banyak agregat dari tabel berbeda | Dua Derived Table terpisah, JOIN secara berurutan |
+| Filter kondisional (masih ingin semua induk muncul) | `WHERE` di dalam Derived Table, `LEFT JOIN` di luar |
+| Perlu keterbacaan tinggi, MySQL 8.0+ | CTE (`WITH … AS (SELECT … GROUP BY)`) |
+| MySQL < 5.7 atau query sederhana | LEFT JOIN + GROUP BY (masih valid) |
+| Verifikasi rencana eksekusi | `EXPLAIN` — cari `DEPENDENT SUBQUERY` dan `Using temporary; Using filesort` |
