@@ -56,6 +56,8 @@ Ketika ada `OR` antara dua kolom yang masing-masing memiliki index berbeda, MySQ
 
 Proses penggabungan ini (disebut **Index Merge Union**) memiliki overhead yang signifikan. Dan dalam banyak kasus — terutama jika selectivity-nya rendah atau tabel hasil JOIN besar — MySQL justru memilih untuk **meninggalkan index sama sekali** dan melakukan full scan, karena optimizer menghitung bahwa full scan lebih murah daripada bolak-balik merge.
 
+> **Analogi:** Bayangkan kamu diminta mencari nama di dua buku telepon yang berbeda, lalu menggabungkan hasilnya sambil membuang yang ganda. Kalau ternyata hampir semua halaman perlu diperiksa di kedua buku, akan lebih cepat langsung membaca satu buku dari awal hingga akhir — daripada bolak-balik berpindah buku dan terus mencocokkan daftar. Itulah keputusan yang diambil MySQL: kalau "ongkos" menggabungkan dua hasil pencarian sudah terlalu besar, lebih baik scan semuanya sekaligus.
+
 ### 2. OR Lintas Tabel JOIN Memaksa Full Scan
 
 Masalah semakin parah ketika `OR` menyeberang ke kolom dari tabel yang di-JOIN. MySQL tidak dapat mendorong (*push down*) filter `OR` ke masing-masing tabel secara terpisah sebelum JOIN dilakukan.
